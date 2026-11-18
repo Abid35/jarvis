@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">Lets Jarvis press Home, Back, lock the screen, take screenshots and open the power menu when you ask by voice.</string>
+</resources>
