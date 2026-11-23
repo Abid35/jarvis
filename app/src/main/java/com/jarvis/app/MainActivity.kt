@@ -1,4 +1,4 @@
-package com.jarvis.app
+   package com.jarvis.app
 
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
@@ -547,4 +547,518 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val out = mutableListOf<String>()
         var rest = text
         while (rest.length > max) {
-            var cut = rest.lastIndexOf(". ", max
+            var cut = rest.lastIndexOf(". ", max)
+            if (cut < 1000) cut = max else cut += 1
+            out.add(rest.substring(0, cut).trim())
+            rest = rest.substring(cut).trim()
+        }
+        if (rest.isNotEmpty()) out.add(rest)
+        return out
+    }
+
+    private fun speak(text: String) {
+        val shown = prettify(text)
+        addMessage(shown, 1)
+        val spoken = shown.replace("\u2022", "").replace("\n", " ").replace(Regex("\\s+"), " ").trim()
+        cancelListening()
+        speaking = true
+        setMode(ArcReactorView.Mode.SPEAKING, "SPEAKING")
+        if (!ttsReady || spoken.isEmpty()) {
+            afterSpeak()
+            return
+        }
+        val chunks = splitForSpeech(spoken)
+        for ((i, part) in chunks.withIndex()) {
+            val id = if (i == chunks.size - 1) "jarvis_last" else "jarvis_$i"
+            val queueMode = if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            tts?.speak(part, queueMode, null, id)
+        }
+    }
+
+    private fun afterSpeak() {
+        speaking = false
+        keepAwake(12000)
+        if (wakeEnabled && inForeground) {
+            handler.postDelayed({ startListening() }, 400)
+        } else if (!wakeEnabled) {
+            setMode(ArcReactorView.Mode.IDLE, "PAUSED - TAP THE REACTOR TO WAKE ME")
+        } else {
+            setMode(ArcReactorView.Mode.IDLE, "PAUSED")
+        }
+    }
+
+    private fun cancelListening() {
+        listening = false
+        recognizer?.cancel()
+    }
+
+    private fun stopListening() {
+        cancelListening()
+        setMode(ArcReactorView.Mode.IDLE, "PAUSED - TAP THE REACTOR TO WAKE ME")
+    }
+
+    private val listener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onPartialResults(partialResults: Bundle?) {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+
+        override fun onError(error: Int) {
+            listening = false
+            if (error == SpeechRecognizer.ERROR_CLIENT) return
+            if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                setMode(ArcReactorView.Mode.IDLE, "NO MICROPHONE ACCESS")
+                addMessage("The Google speech service has no microphone permission. Allow it in Settings, Apps, Google, Permissions, Microphone.", 2)
+                return
+            }
+            if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                recognizer?.destroy()
+                recognizer = null
+            }
+            val delay = if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) 400L else 2500L
+            handler.postDelayed({ startListening() }, delay)
+        }
+
+        override fun onResults(results: Bundle?) {
+            listening = false
+            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            val text = list?.firstOrNull()?.lowercase(Locale.ROOT) ?: ""
+            handleSpeech(text)
+        }
+    }
+
+    private fun startListening() {
+        if (listening || speaking || !inForeground || !wakeEnabled) return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            addMessage("Speech recognition is not available. Install or update the Google app.", 2)
+            return
+        }
+        if (recognizer == null) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            recognizer?.setRecognitionListener(listener)
+        }
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+        listening = true
+        if (isAwake()) {
+            setMode(ArcReactorView.Mode.LISTENING, "LISTENING")
+        } else {
+            setMode(ArcReactorView.Mode.IDLE, "SAY \"JARVIS\" TO WAKE ME")
+        }
+        recognizer?.startListening(intent)
+    }
+
+    private fun handleSpeech(raw: String) {
+        var cmd = raw.trim()
+        val heardWake = WAKE_WORDS.firstOrNull { cmd.contains(it) }
+
+        if (heardWake != null) {
+            cmd = cmd.substringAfter(heardWake).trim(' ', ',', '.')
+            if (cmd.isEmpty()) {
+                keepAwake(15000)
+                speak("Yes, sir?")
+                return
+            }
+        } else if (!isAwake()) {
+            handler.postDelayed({ startListening() }, 300)
+            return
+        }
+        if (cmd.isEmpty()) {
+            handler.postDelayed({ startListening() }, 300)
+            return
+        }
+
+        addMessage(cmd, 0)
+        val command = cmd
+
+        if (has(command, "go to sleep", "goodbye", "stop listening")) {
+            wakeSwitch.isChecked = false
+            speak("Goodbye, sir. Tap the reactor whenever you need me.")
+            return
+        }
+
+        setMode(ArcReactorView.Mode.THINKING, "PROCESSING")
+        Thread {
+            val reply = try {
+                runCommand(command)
+            } catch (e: Exception) {
+                "Something went wrong, sir."
+            }
+            runOnUiThread { speak(reply) }
+        }.start()
+    }
+
+    private fun has(c: String, vararg words: String): Boolean = words.any { c.contains(it) }
+
+    private fun launch(i: Intent) {
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runOnUiThread {
+            try {
+                startActivity(i)
+            } catch (e: Exception) {
+                addMessage("Could not open that: " + e.message, 2)
+            }
+        }
+    }
+
+    private fun globalAction(action: Int, done: String): String {
+        val svc = JarvisAccessibilityService.instance
+        if (svc == null) {
+            launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            return "I need accessibility access for that, sir. Please switch on Jarvis in the list that just opened."
+        }
+        svc.performGlobalAction(action)
+        return done
+    }
+
+    private fun runCommand(c: String): String {
+        // Flashlight
+        if (has(c, "flashlight", "torch")) {
+            return setTorch(!c.contains("off"))
+        }
+
+        // Accessibility actions
+        if (has(c, "go home", "home screen")) {
+            return globalAction(AccessibilityService.GLOBAL_ACTION_HOME, "Going home, sir.")
+        }
+        if (has(c, "go back")) {
+            return globalAction(AccessibilityService.GLOBAL_ACTION_BACK, "Going back, sir.")
+        }
+        if (has(c, "recent apps", "show recents")) {
+            return globalAction(AccessibilityService.GLOBAL_ACTION_RECENTS, "Here are your recent apps, sir.")
+        }
+        if (c.contains("notifications")) {
+            return globalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS, "Opening notifications, sir.")
+        }
+        if (c.contains("quick settings")) {
+            return globalAction(AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS, "Opening quick settings, sir.")
+        }
+        if (has(c, "lock the phone", "lock my phone", "lock the screen", "lock screen") && Build.VERSION.SDK_INT >= 28) {
+            return globalAction(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN, "Locking the phone, sir.")
+        }
+        if (c.contains("screenshot") && Build.VERSION.SDK_INT >= 28) {
+            return globalAction(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT, "Screenshot taken, sir.")
+        }
+        if (has(c, "power off", "restart", "reboot", "turn off the phone", "switch off the phone", "shut down the phone")) {
+            return globalAction(
+                AccessibilityService.GLOBAL_ACTION_POWER_DIALOG,
+                "I opened the power menu, sir. Android does not let apps shut the phone down directly, so tap Power off or Restart."
+            )
+        }
+
+        // Wi-Fi, Bluetooth, airplane (Android blocks silent toggling)
+        if (has(c, "wifi", "wi-fi", "wi fi") && has(c, "turn", "switch", "enable", "disable", "open", "connect")) {
+            val i = if (Build.VERSION.SDK_INT >= 29) Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY) else Intent(Settings.ACTION_WIFI_SETTINGS)
+            launch(i)
+            return "Android does not let apps flip Wi-Fi directly, sir. I opened the Wi-Fi panel for you."
+        }
+        if (c.contains("bluetooth") && has(c, "turn", "switch", "enable", "disable", "open")) {
+            launch(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            return "Opening Bluetooth settings, sir."
+        }
+        if (c.contains("airplane") || c.contains("flight mode")) {
+            launch(Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS))
+            return "Opening airplane mode settings, sir."
+        }
+
+        // Volume
+        if (has(c, "volume up", "louder")) {
+            adjustVolume(AudioManager.ADJUST_RAISE)
+            return "Volume increased, sir."
+        }
+        if (has(c, "volume down", "quieter", "lower the volume")) {
+            adjustVolume(AudioManager.ADJUST_LOWER)
+            return "Volume lowered, sir."
+        }
+
+        // Battery, time, date
+        if (c.contains("battery")) {
+            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            return "Battery is at $pct percent, sir."
+        }
+        if (has(c, "what time", "the time")) {
+            return "It is " + SimpleDateFormat("h:mm a", Locale.UK).format(Date()) + ", sir."
+        }
+        if (has(c, "what day", "the date", "today's date")) {
+            return "Today is " + SimpleDateFormat("EEEE, d MMMM yyyy", Locale.UK).format(Date()) + ", sir."
+        }
+
+        // Weather
+        if (c.contains("weather") || c.contains("temperature")) {
+            val saved = prefs.getString("city", DEFAULT_CITY) ?: DEFAULT_CITY
+            val city = if (c.contains(" in ")) c.substringAfter(" in ").trim() else saved
+            try {
+                val url = URL("https://wttr.in/" + URLEncoder.encode(city, "UTF-8") + "?format=%C+%t")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.connectTimeout = 15000
+                conn.readTimeout = 20000
+                val t = conn.inputStream.bufferedReader().use { it.readText() }.trim()
+                return "In $city it is " + t.replace("+", "") + ", sir."
+            } catch (e: Exception) {
+                return askGemini(c)
+            }
+        }
+
+        // Timer
+        if (c.contains("timer")) {
+            val m = Regex("(\\d+)\\s*(second|minute|hour)").find(c) ?: return "For how long, sir?"
+            val n = m.groupValues[1].toInt()
+            val mult = when (m.groupValues[2]) {
+                "second" -> 1
+                "minute" -> 60
+                else -> 3600
+            }
+            val i = Intent(AlarmClock.ACTION_SET_TIMER)
+            i.putExtra(AlarmClock.EXTRA_LENGTH, n * mult)
+            i.putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+            launch(i)
+            return "Timer set, sir."
+        }
+
+        // Alarm
+        if (has(c, "alarm", "wake me")) {
+            val cleaned = c.replace(".", "").replace("a m", "am").replace("p m", "pm")
+            val m = Regex("(\\d{1,2})(?:[: ](\\d{2}))?\\s*(am|pm)?").find(cleaned) ?: return "For what time, sir?"
+            var h = m.groupValues[1].toInt()
+            val min = if (m.groupValues[2].isEmpty()) 0 else m.groupValues[2].toInt()
+            val ap = m.groupValues[3]
+            if (ap == "pm" && h < 12) h += 12
+            if (ap == "am" && h == 12) h = 0
+            if (h > 23 || min > 59) return "I did not catch that time, sir."
+            val i = Intent(AlarmClock.ACTION_SET_ALARM)
+            i.putExtra(AlarmClock.EXTRA_HOUR, h)
+            i.putExtra(AlarmClock.EXTRA_MINUTES, min)
+            i.putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+            launch(i)
+            return "Alarm set for " + String.format(Locale.UK, "%d:%02d", h, min) + ", sir."
+        }
+
+        // Call
+        if (c.startsWith("call ")) {
+            val target = c.removePrefix("call ").trim()
+            val digits = target.replace(" ", "").replace("-", "")
+            val number: String
+            if (digits.matches(Regex("\\+?\\d{5,}"))) {
+                number = digits
+            } else {
+                number = findNumber(target) ?: return "I could not find $target in your contacts, sir."
+            }
+            val uri = Uri.parse("tel:" + Uri.encode(number))
+            val granted = checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+            launch(Intent(if (granted) Intent.ACTION_CALL else Intent.ACTION_DIAL, uri))
+            return "Calling $target, sir."
+        }
+
+        // Open any app
+        val openMatch = Regex("(?:^|\\s)(?:open|launch)\\s+(.+)$").find(c)
+        if (openMatch != null) {
+            val spoken = openMatch.groupValues[1].trim()
+            val result = openApp(spoken)
+            if (result != null) return result
+            if (c.startsWith("open ") || c.startsWith("launch ")) {
+                return "I could not find an app called $spoken, sir."
+            }
+        }
+
+        // Google search in the browser
+        if (c.startsWith("search ") || c.startsWith("google ")) {
+            val q = c.removePrefix("search for ").removePrefix("search ").removePrefix("google ")
+            launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + URLEncoder.encode(q, "UTF-8"))))
+            return "Searching Google for $q, sir."
+        }
+
+        // YouTube
+        if (c.startsWith("play ")) {
+            val q = c.removePrefix("play ").removeSuffix(" on youtube")
+            launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + URLEncoder.encode(q, "UTF-8"))))
+            return "Playing $q on YouTube, sir."
+        }
+
+        // Everything else: ask the AI (with live Google Search)
+        return askGemini(c)
+    }
+
+    private fun norm(s: String): String = s.lowercase().filter { it.isLetterOrDigit() }
+
+    private fun openApp(spoken: String): String? {
+        val cleaned = Regex("\\b(the|app|application)\\b").replace(spoken, "")
+        val name = norm(cleaned)
+        if (name.isEmpty()) return null
+        val pm = packageManager
+        val apps = pm.queryIntentActivities(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+        )
+        var match = apps.firstOrNull { norm(it.loadLabel(pm).toString()) == name }
+        if (match == null) {
+            match = apps.firstOrNull {
+                val l = norm(it.loadLabel(pm).toString())
+                l.length >= 3 && (l.contains(name) || name.contains(l))
+            }
+        }
+        if (match != null) {
+            val li = pm.getLaunchIntentForPackage(match.activityInfo.packageName)
+            if (li != null) {
+                launch(li)
+                return "Opening " + match.loadLabel(pm) + ", sir."
+            }
+        }
+        val pkg = knownApps[name]
+        if (pkg != null) {
+            val li = pm.getLaunchIntentForPackage(pkg)
+            if (li != null) {
+                launch(li)
+                return "Opening $spoken, sir."
+            }
+        }
+        return null
+    }
+
+    private fun setTorch(on: Boolean): String {
+        val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val id = cm.cameraIdList.firstOrNull {
+            cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        } ?: return "I could not find a flashlight, sir."
+        cm.setTorchMode(id, on)
+        return if (on) "Flashlight on, sir." else "Flashlight off, sir."
+    }
+
+    private fun adjustVolume(direction: Int) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        for (n in 1..3) {
+            am.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
+        }
+    }
+
+    private fun findNumber(name: String): String? {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
+        val phone = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+        val cursor = contentResolver.query(
+            phone,
+            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+            arrayOf("%$name%"),
+            null
+        )
+        cursor?.use {
+            if (it.moveToFirst()) return it.getString(0)
+        }
+        return null
+    }
+
+    // -----------------------------------------------------------------------
+    // Gemini
+    // -----------------------------------------------------------------------
+    private fun request(model: String, key: String, withSearch: Boolean): Pair<Int, String> {
+        val contents = JSONArray()
+        for ((role, text) in chat) {
+            val part = JSONObject().put("text", text)
+            contents.put(JSONObject().put("role", role).put("parts", JSONArray().put(part)))
+        }
+        val sys = JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM)))
+        val body = JSONObject()
+            .put("system_instruction", sys)
+            .put("contents", contents)
+            .put("generationConfig", JSONObject().put("maxOutputTokens", 2048))
+        if (withSearch) {
+            body.put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
+        }
+
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setRequestProperty("x-goog-api-key", key)
+        conn.connectTimeout = 20000
+        conn.readTimeout = 90000
+        conn.doOutput = true
+        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val resp = stream?.bufferedReader()?.use { it.readText() } ?: ""
+        return Pair(code, resp)
+    }
+
+    private fun parseAnswer(resp: String): String {
+        val parts = JSONObject(resp)
+            .getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts")
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) {
+            sb.append(parts.getJSONObject(i).optString("text", ""))
+        }
+        return sb.toString().trim()
+    }
+
+    private fun dropLastUser() {
+        if (chat.isNotEmpty() && chat[chat.size - 1].first == "user") {
+            chat.removeAt(chat.size - 1)
+        }
+    }
+
+    private fun askGemini(q: String): String {
+        val key = prefs.getString("key", "") ?: ""
+        if (key.isBlank()) return "Please open Settings and save your Gemini key, sir."
+        chat.add("user" to q)
+        while (chat.size > 20) chat.removeAt(0)
+
+        var lastErr = ""
+        var timeouts = 0
+        outer@ for (model in MODELS) {
+            for (useSearch in listOf(true, false)) {
+                try {
+                    val (code, resp) = request(model, key, useSearch)
+                    if (code in 200..299) {
+                        val answer = parseAnswer(resp)
+                        if (answer.isNotEmpty()) {
+                            chat.add("model" to answer)
+                            return answer
+                        }
+                        lastErr = "Empty answer from $model"
+                        continue
+                    }
+                    if (resp.contains("API_KEY_INVALID") || resp.contains("API key not valid")) {
+                        dropLastUser()
+                        return "Your Gemini key was rejected, sir. Please save a new key in Settings."
+                    }
+                    if (code == 429) {
+                        dropLastUser()
+                        return "I have reached the free limit for now, sir. Please try again in a little while."
+                    }
+                    lastErr = "Gemini error $code ($model): " + resp.take(150)
+                } catch (e: UnknownHostException) {
+                    dropLastUser()
+                    return "I cannot reach the internet, sir."
+                } catch (e: SocketTimeoutException) {
+                    timeouts++
+                    lastErr = "Timeout ($model)"
+                    if (timeouts >= 2) break@outer
+                } catch (e: Exception) {
+                    lastErr = "Error ($model): " + e.message
+                }
+            }
+        }
+        dropLastUser()
+        addMessage(lastErr, 2)
+        return "I am having trouble reaching my servers, sir."
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        recognizer?.destroy()
+        tts?.shutdown()
+    }
+}
+
+
+
+
+
+
+									   
